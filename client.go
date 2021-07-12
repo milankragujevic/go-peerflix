@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"compress/gzip"
 	"fmt"
 	"io"
@@ -38,24 +39,49 @@ type Client struct {
 	Client   *torrent.Client
 	Torrent  *torrent.Torrent
 	Progress int64
-	Port     int
+	Uploaded int64
+	Config   ClientConfig
+}
+
+// ClientConfig specifies the behaviour of a client.
+type ClientConfig struct {
+	TorrentPath    string
+	Port           int
+	TorrentPort    int
+	Seed           bool
+	TCP            bool
+	MaxConnections int
+}
+
+// NewClientConfig creates a new default configuration.
+func NewClientConfig() ClientConfig {
+	return ClientConfig{
+		Port:           8080,
+		TorrentPort:    50007,
+		Seed:           false,
+		TCP:            true,
+		MaxConnections: 200,
+	}
 }
 
 // NewClient creates a new torrent client based on a magnet or a torrent file.
 // If the torrent file is on http, we try downloading it.
-func NewClient(torrentPath string, port int, seed bool, tcp bool) (client Client, err error) {
+func NewClient(cfg ClientConfig) (client Client, err error) {
 	var t *torrent.Torrent
 	var c *torrent.Client
 
-	client.Port = port
+	client.Config = cfg
+
+	blocklist := getBlocklist()
+	torrentConfig := torrent.NewDefaultClientConfig()
+	torrentConfig.DataDir = os.TempDir()
+	torrentConfig.NoUpload = !cfg.Seed
+	torrentConfig.DisableTCP = !cfg.TCP
+	torrentConfig.ListenPort = cfg.TorrentPort
+	torrentConfig.IPBlocklist = blocklist
 
 	// Create client.
-	c, err = torrent.NewClient(&torrent.Config{
-		DataDir:    os.TempDir(),
-		NoUpload:   !seed,
-		Seed:       seed,
-		DisableTCP: !tcp,
-	})
+	c, err = torrent.NewClient(torrentConfig)
 
 	if err != nil {
 		return client, ClientError{Type: "creating torrent client", Origin: err}
@@ -66,47 +92,46 @@ func NewClient(torrentPath string, port int, seed bool, tcp bool) (client Client
 	// Add torrent.
 
 	// Add as magnet url.
-	if strings.HasPrefix(torrentPath, "magnet:") {
-		if t, err = c.AddMagnet(torrentPath); err != nil {
+	if strings.HasPrefix(cfg.TorrentPath, "magnet:") {
+		if t, err = c.AddMagnet(cfg.TorrentPath); err != nil {
 			return client, ClientError{Type: "adding torrent", Origin: err}
 		}
 	} else {
 		// Otherwise add as a torrent file.
 
 		// If it's online, we try downloading the file.
-		if isHTTP.MatchString(torrentPath) {
-			if torrentPath, err = downloadFile(torrentPath); err != nil {
+		if isHTTP.MatchString(cfg.TorrentPath) {
+			if cfg.TorrentPath, err = downloadFile(cfg.TorrentPath); err != nil {
 				return client, ClientError{Type: "downloading torrent file", Origin: err}
 			}
 		}
 
-		// Check if the file exists.
-		if _, err = os.Stat(torrentPath); err != nil {
-			return client, ClientError{Type: "file not found", Origin: err}
-		}
-
-		if t, err = c.AddTorrentFromFile(torrentPath); err != nil {
+		if t, err = c.AddTorrentFromFile(cfg.TorrentPath); err != nil {
 			return client, ClientError{Type: "adding torrent to the client", Origin: err}
 		}
 	}
 
 	client.Torrent = t
+	client.Torrent.SetMaxEstablishedConns(cfg.MaxConnections)
 
 	go func() {
 		<-t.GotInfo()
 		t.DownloadAll()
 
 		// Prioritize first 5% of the file.
-		client.getLargestFile().PrioritizeRegion(0, int64(t.NumPieces()/100*5))
+		largestFile := client.getLargestFile()
+		firstPieceIndex := largestFile.Offset() * int64(t.NumPieces()) / t.Length()
+		endPieceIndex := (largestFile.Offset() + largestFile.Length()) * int64(t.NumPieces()) / t.Length()
+		for idx := firstPieceIndex; idx <= endPieceIndex*5/100; idx++ {
+			t.Piece(int(idx)).SetPriority(torrent.PiecePriorityNow)
+		}
 	}()
-
-	go client.addBlocklist()
 
 	return
 }
 
 // Download and add the blocklist.
-func (c *Client) addBlocklist() {
+func getBlocklist() iplist.Ranger {
 	var err error
 	blocklistPath := os.TempDir() + "/go-peerflix-blocklist.gz"
 
@@ -116,32 +141,34 @@ func (c *Client) addBlocklist() {
 
 	if err != nil {
 		log.Printf("Error downloading blocklist: %s", err)
-		return
+		return nil
 	}
 
 	// Load blocklist.
+	// #nosec
+	// We trust our temporary directory as we just wrote the file there ourselves.
 	blocklistReader, err := os.Open(blocklistPath)
 	if err != nil {
 		log.Printf("Error opening blocklist: %s", err)
-		return
+		return nil
 	}
 
 	// Extract file.
 	gzipReader, err := gzip.NewReader(blocklistReader)
 	if err != nil {
 		log.Printf("Error extracting blocklist: %s", err)
-		return
+		return nil
 	}
 
 	// Read as iplist.
 	blocklist, err := iplist.NewFromReader(gzipReader)
 	if err != nil {
 		log.Printf("Error reading blocklist: %s", err)
-		return
+		return nil
 	}
 
-	log.Printf("Setting blocklist.\nFound %d ranges\n", blocklist.NumRanges())
-	c.Client.SetIPBlockList(blocklist)
+	log.Printf("Loading blocklist.\nFound %d ranges\n", blocklist.NumRanges())
+	return blocklist
 }
 
 func downloadBlockList(blocklistPath string) (err error) {
@@ -152,37 +179,7 @@ func downloadBlockList(blocklistPath string) (err error) {
 		return
 	}
 
-	// Ungzip file.
-	in, err := os.Open(fileName)
-	if err != nil {
-		log.Printf("Error extracting blocklist: %s\n", err)
-		return
-	}
-	defer func() {
-		if err = in.Close(); err != nil {
-			log.Printf("Error closing the blocklist gzip file: %s", err)
-		}
-	}()
-
-	// Write to file.
-	out, err := os.Create(blocklistPath)
-	if err != nil {
-		log.Printf("Error writing blocklist: %s\n", err)
-		return
-	}
-	defer func() {
-		if err = out.Close(); err != nil {
-			log.Printf("Error closing the blocklist file: %s", err)
-		}
-	}()
-
-	_, err = io.Copy(out, in)
-	if err != nil {
-		log.Printf("Error writing the blocklist file: %s", err)
-		return
-	}
-
-	return
+	return os.Rename(fileName, blocklistPath)
 }
 
 // Close cleans up the connections.
@@ -199,32 +196,43 @@ func (c *Client) Render() {
 		return
 	}
 
-	var currentProgress = t.BytesCompleted()
-	speed := humanize.Bytes(uint64(currentProgress-c.Progress)) + "/s"
+	currentProgress := t.BytesCompleted()
+	downloadSpeed := humanize.Bytes(uint64(currentProgress-c.Progress)) + "/s"
 	c.Progress = currentProgress
 
 	complete := humanize.Bytes(uint64(currentProgress))
 	size := humanize.Bytes(uint64(t.Info().TotalLength()))
 
-	print(clearScreen)
-	fmt.Println(t.Info().Name)
-	fmt.Println("=============================================================")
+	bytesWrittenData := t.Stats().BytesWrittenData
+	uploadProgress := (&bytesWrittenData).Int64() - c.Uploaded
+	uploadSpeed := humanize.Bytes(uint64(uploadProgress)) + "/s"
+	c.Uploaded = uploadProgress
+	percentage := c.percentage()
+	totalLength := t.Info().TotalLength()
+
+	output := bufio.NewWriter(os.Stdout)
+
+	fmt.Fprint(output, clearScreen)
+	fmt.Fprint(output, t.Info().Name+"\n")
+	fmt.Fprint(output, strings.Repeat("=", len(t.Info().Name))+"\n")
 	if c.ReadyForPlayback() {
-		fmt.Printf("Stream: \thttp://localhost:%d\n", c.Port)
+		fmt.Fprintf(output, "Stream: \thttp://localhost:%d\n", c.Config.Port)
+	}
+	if currentProgress > 0 {
+		fmt.Fprintf(output, "Progress: \t%s / %s  %.2f%%\n", complete, size, percentage)
+	}
+	if currentProgress < totalLength {
+		fmt.Fprintf(output, "Download speed: %s\n", downloadSpeed)
+	}
+	if c.Config.Seed {
+		fmt.Fprintf(output, "Upload speed: \t%s", uploadSpeed)
 	}
 
-	if currentProgress > 0 {
-		fmt.Printf("Progress: \t%s / %s  %.2f%%\n", complete, size, c.percentage())
-	}
-	if currentProgress < t.Info().TotalLength() {
-		fmt.Printf("Download speed: %s\n", speed)
-	}
-	//fmt.Printf("Connections: \t%d\n", len(t.Conns))
-	//fmt.Printf("%s\n", c.RenderPieces())
+	output.Flush()
 }
 
 func (c Client) getLargestFile() *torrent.File {
-	var target torrent.File
+	var target *torrent.File
 	var maxSize int64
 
 	for _, file := range c.Torrent.Files() {
@@ -234,7 +242,7 @@ func (c Client) getLargestFile() *torrent.File {
 		}
 	}
 
-	return &target
+	return target
 }
 
 /*
@@ -304,19 +312,21 @@ func downloadFile(URL string) (fileName string, err error) {
 	}
 
 	defer func() {
-		if err = file.Close(); err != nil {
-			log.Printf("Error closing torrent file: %s", err)
+		if ferr := file.Close(); ferr != nil {
+			log.Printf("Error closing torrent file: %s", ferr)
 		}
 	}()
 
+	// #nosec
+	// We are downloading the url the user passed to us, we trust it is a torrent file.
 	response, err := http.Get(URL)
 	if err != nil {
 		return
 	}
 
 	defer func() {
-		if err = response.Body.Close(); err != nil {
-			log.Printf("Error closing torrent file: %s", err)
+		if ferr := response.Body.Close(); ferr != nil {
+			log.Printf("Error closing torrent file: %s", ferr)
 		}
 	}()
 
